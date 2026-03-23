@@ -1,8 +1,8 @@
 openapi: 3.0.3
 info:
   title: Stellar Trust Escrow Backend API
-  version: 0.2.0
-  description: Shared pagination contract plus notification endpoints.
+  version: 0.1.0
+  description: Shared pagination contract for collection endpoints.
 paths:
   /api/escrows:
     get:
@@ -69,35 +69,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PaginatedResponse'
-  /api/notifications/events:
-    post:
-      summary: Queue email notifications for escrow events
-      responses:
-        '202':
-          description: Emails accepted into the queue
-  /api/notifications/unsubscribe:
-    get:
-      summary: Unsubscribe an email recipient
-      responses:
-        '200':
-          description: Recipient unsubscribed
-    post:
-      summary: API unsubscribe endpoint
-      responses:
-        '200':
-          description: Recipient unsubscribed
-  /api/notifications/subscribe:
-    post:
-      summary: Re-subscribe an email recipient
-      responses:
-        '200':
-          description: Recipient subscribed
-  /api/notifications/queue:
-    get:
-      summary: Inspect queued and delivered notifications
-      responses:
-        '200':
-          description: Queue snapshot
 components:
   parameters:
     Page:
@@ -134,13 +105,19 @@ components:
           items: {}
         page:
           type: integer
+          example: 1
         limit:
           type: integer
+          example: 20
         total:
           type: integer
+          example: 42
         totalPages:
           type: integer
+          example: 3
         hasNextPage:
           type: boolean
+          example: true
         hasPreviousPage:
           type: boolean
+          example: false
