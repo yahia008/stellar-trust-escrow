@@ -1,6 +1,11 @@
+// Sentry must be initialised before any other imports so it can
+// instrument all subsequent modules (HTTP, DB, etc.)
+import './lib/sentry.js';
+import * as Sentry from '@sentry/node';
+
 /* eslint-disable no-undef */
 import 'dotenv/config';
-import compression from 'compression';
+import compressionMiddleware from './middleware/compression.js';
 import cors from 'cors';
 import express from 'express';
 import helmet from 'helmet';
@@ -18,6 +23,7 @@ import paymentRoutes from './api/routes/paymentRoutes.js';
 import reputationRoutes from './api/routes/reputationRoutes.js';
 import userRoutes from './api/routes/userRoutes.js';
 import auditRoutes from './api/routes/auditRoutes.js';
+import auditMiddleware from './api/middleware/audit.js';
 import cache from './lib/cache.js';
 import { attachPrismaMetrics } from './lib/prismaMetrics.js';
 import prisma from './lib/prisma.js';
@@ -33,91 +39,122 @@ attachPrismaMetrics(prisma);
 
 const PORT = process.env.PORT || 4000;
 
-export function createApp() {
-  const app = express();
+// ── Sentry request handler — must be first middleware ─────────────────────────
+// Attaches trace context and request data to every event captured downstream.
+app.use(Sentry.expressRequestHandler());
 
-  app.use(helmet());
-  app.use(compression());
-  app.use(metricsMiddleware);
-  app.use(responseTime);
-  app.use(
-    cors({
-      origin: process.env.ALLOWED_ORIGINS?.split(',') || 'http://localhost:3000',
-      credentials: true,
-    }),
-  );
-  app.use(morgan('combined'));
-  app.use(express.json());
-  app.use(express.urlencoded({ extended: true }));
-  app.use(auditMiddleware);
+app.use(helmet());
+app.use(compressionMiddleware);
+app.use(metricsMiddleware);
+app.use(responseTime);
+app.use(
+  cors({
+    origin: process.env.ALLOWED_ORIGINS?.split(',') || 'http://localhost:3000',
+    credentials: true,
+  }),
+);
+app.use(morgan('combined'));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(auditMiddleware);
 
-  app.use('/api/reputation/leaderboard', leaderboardRateLimit);
-  app.use('/api', apiRateLimit);
+// ── Sentry tracing handler — after body parsers, before routes ────────────────
+app.use(Sentry.expressTracingHandler());
 
-  app.get('/health', async (_req, res) => {
-    let dbStatus = 'ok';
-    let dbLatencyMs = null;
+const defaultLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  message: 'Too many requests from this IP, please try again later.',
+});
 
-    try {
-      const t0 = Date.now();
-      await prisma.$queryRaw`SELECT 1`;
-      dbLatencyMs = Date.now() - t0;
-    } catch {
-      dbStatus = 'error';
-    }
+const leaderboardLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  message: 'Too many leaderboard requests, please slow down.',
+});
 
-    const status = dbStatus === 'ok' ? 'ok' : 'degraded';
-    res.status(dbStatus === 'ok' ? 200 : 503).json({
-      status,
-      timestamp: new Date().toISOString(),
-      uptime: Math.floor(process.uptime()),
-      cache: cache.analytics(),
-      db: { status: dbStatus, latencyMs: dbLatencyMs },
-    });
+app.use('/api/', defaultLimiter);
+app.use('/api/reputation/leaderboard', leaderboardLimiter);
+
+app.get('/health', async (_req, res) => {
+  let dbStatus = 'ok';
+  let dbLatencyMs = null;
+
+  try {
+    const t0 = Date.now();
+    await prisma.$queryRaw`SELECT 1`;
+    dbLatencyMs = Date.now() - t0;
+  } catch {
+    dbStatus = 'error';
+  }
+
+  const status = dbStatus === 'ok' ? 'ok' : 'degraded';
+  res.status(dbStatus === 'ok' ? 200 : 503).json({
+    status,
+    timestamp: new Date().toISOString(),
+    uptime: Math.floor(process.uptime()),
+    cache: cache.analytics(),
+    db: { status: dbStatus, latencyMs: dbLatencyMs },
   });
+});
 
-  app.use('/api/escrows', escrowRoutes);
-  app.use('/api/users', userRoutes);
-  app.use('/api/reputation', reputationRoutes);
-  app.use('/api/disputes', disputeRoutes);
-  app.use('/api/notifications', notificationRoutes);
-  app.use('/api/events', eventRoutes);
-  app.use('/api/kyc', kycRoutes);
-  app.use('/api/payments', paymentRoutes);
-  app.use('/api/admin', adminRoutes);
-  app.use('/api/audit', auditRoutes);
-  app.use('/metrics', metricsRoutes);
+app.use('/api/escrows', escrowRoutes);
+app.use('/api/users', userRoutes);
+app.use('/api/reputation', reputationRoutes);
+app.use('/api/disputes', disputeRoutes);
+app.use('/api/notifications', notificationRoutes);
+app.use('/api/events', eventRoutes);
+app.use('/api/kyc', kycRoutes);
+app.use('/api/payments', paymentRoutes);
+app.use('/api/audit', auditRoutes);
 
-  app.use((req, res) => {
-    res.status(404).json({ error: 'Route not found' });
-  });
+// ── 404 handler ───────────────────────────────────────────────────────────────
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route not found' });
+});
 
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  app.use((err, _req, res, _next) => {
+// ── Sentry error handler — must be before the generic error handler ───────────
+// Captures unhandled Express errors and attaches request context.
+app.use(Sentry.expressErrorHandler({
+  shouldHandleError(err) {
+    // Report all 5xx errors; skip expected 4xx client errors
+    return !err.statusCode || err.statusCode >= 500;
+  },
+}));
+
+// ── Generic error handler ─────────────────────────────────────────────────────
+app.use((err, _req, res, _next) => {
+  const statusCode = err.statusCode || 500;
+
+  // Attach Sentry event ID to response so support can correlate reports
+  const sentryId = res.sentry;
+  const body = { error: err.message || 'Internal server error' };
+  if (sentryId) body.errorId = sentryId;
+
+  if (statusCode >= 500) {
     console.error(err.stack);
-    errorsTotal.inc({ type: err.name || 'Error', route: _req?.path || 'unknown' });
-    res.status(err.statusCode || 500).json({
-      error: err.message || 'Internal server error',
-    });
+  }
+
+  res.status(statusCode).json(body);
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+app.use((err, _req, res, _next) => {
+  console.error(err.stack);
+  errorsTotal.inc({ type: err.name || 'Error', route: _req?.path || 'unknown' });
+  res.status(err.statusCode || 500).json({
+    error: err.message || 'Internal server error',
   });
+});
 
-  return app;
-}
-
-const app = createApp();
-
-export async function startServer() {
-  return app.listen(PORT, async () => {
-    console.log(`API running on port ${PORT}`);
-    console.log(`Network: ${process.env.STELLAR_NETWORK}`);
-    await emailService.start();
-    console.log('[EmailService] Queue processor started');
-    startIndexer().catch((err) => console.error('[Indexer] Failed to start:', err.message));
+app.listen(PORT, async () => {
+  console.log(`API running on port ${PORT}`);
+  console.log(`Network: ${process.env.STELLAR_NETWORK}`);
+  await emailService.start();
+  console.log('[EmailService] Queue processor started');
+  startIndexer().catch((err) => {
+    console.error('[Indexer] Failed to start:', err.message);
+    Sentry.captureException(err, { tags: { component: 'indexer' } });
   });
-}
-
-if (process.env.NODE_ENV !== 'test') {
-  startServer();
-}
+  startIndexer().catch((err) => console.error('[Indexer] Failed to start:', err.message));
+});
 
 export default app;
